@@ -17,6 +17,7 @@ Base vs LoRA 推理对比脚本：比较原始模型和微调模型在医疗问�
 """
 
 import argparse
+import gc
 from pathlib import Path
 
 import torch
@@ -124,3 +125,82 @@ def generate(tokenizer, model, question: str, max_new_tokens: int) -> str:
     # apply_chat_template 会把 messages 转成带特殊标记的 token 序列
     # 例如 Qwen 会生成类似这样的结构：
     #
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt",
+    )
+    if hasattr(inputs, "input_ids"):
+        input_ids = inputs.input_ids
+    else:
+        input_ids = inputs
+
+    device = next(model.parameters()).device
+    input_ids = input_ids.to(device)
+    prompt_len = input_ids.shape[1]
+
+    # --- 步骤 3: 生成 ---
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+        )
+
+    # --- 步骤 4: 只解码新生成的 token ---
+    new_ids = output_ids[0, prompt_len:]
+    return tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+
+
+# ============================================================
+# 主流程
+# ============================================================
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Compare base and LoRA responses.")
+    parser.add_argument(
+        "--model-name",
+        default="Qwen/Qwen2.5-1.5B-Instruct",
+        help="HuggingFace repo id 或本地模型目录",
+    )
+    parser.add_argument(
+        "--adapter-dir",
+        type=Path,
+        default=Path("outputs/qwen-medical-lora"),
+    )
+    parser.add_argument(
+        "--question",
+        default="高血压患者日常生活中应该注意什么？",
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    args = parser.parse_args()
+
+    print(f"问题: {args.question}\n")
+
+    print("=== Base 模型 ===")
+    tokenizer, model = load_model(args.model_name, adapter_dir=None)
+    base_answer = generate(tokenizer, model, args.question, args.max_new_tokens)
+    print(base_answer)
+    print()
+
+    del model, tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if not args.adapter_dir.exists():
+        print(f"LoRA adapter 不存在: {args.adapter_dir}")
+        return
+
+    print("=== LoRA 模型 ===")
+    tokenizer, model = load_model(args.model_name, adapter_dir=args.adapter_dir)
+    lora_answer = generate(tokenizer, model, args.question, args.max_new_tokens)
+    print(lora_answer)
+
+
+if __name__ == "__main__":
+    main()
