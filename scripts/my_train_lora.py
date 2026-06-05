@@ -10,7 +10,7 @@
 
 运行方式（模块 4 训练）：
     python scripts/my_train_lora.py --max-train-samples 50 --max-valid-samples 20 --epochs 1 --grad-accum 4 --max-length 256
-
+    python scripts/my_train_lora.py --r 4 --output-dir outputs/lora-r4 --max-train-samples 200
 参考代码：scripts/train_lora.py（先看懂，关掉，再自己写）
 """
 
@@ -38,7 +38,17 @@ IGNORE_INDEX = -100
 def load_jsonl(path):
     """读取 jsonl 文件，返回 list[dict]"""
     # TODO: 你的代码（和模块 1 的 read_jsonl 一样）
-    pass
+    items: list[dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()           # 去掉每行末尾的换行符和空白
+            if not line:                   # 跳过空行
+                continue
+            try:
+                items.append(json.loads(line))  # 把 JSON 字符串解析成 Python 字典
+            except json.JSONDecodeError:
+                continue                   # 如果某行 JSON 格式有误，跳过而不是报错
+    return items
 
 
 # ============================================================
@@ -68,7 +78,16 @@ def build_messages(example):
     - assistant = output
     """
     # TODO: 你的代码
-    pass
+    user_content = example["instruction"].strip()
+    input_text = example.get("input", "").strip()
+    if input_text:
+        user_content = f"{user_content}\n\n问题：{input_text}"
+
+    return [
+        {"role": "system", "content": "你是一名谨慎的医疗健康问答助手。回答应清晰、专业，并提醒用户必要时及时就医。"},
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": example["output"].strip()},
+    ]
 
 
 def preprocess(example, tokenizer, max_length):
@@ -104,7 +123,32 @@ def preprocess(example, tokenizer, max_length):
     - 这叫 assistant-only loss mask，是 SFT 的标准做法
     """
     # TODO: 你的代码
-    pass
+    messages = build_messages(example)
+    prompt_messages = messages[:-1]
+    answer = messages[-1]["content"]
+
+    prompt_ids = tokenizer.apply_chat_template(
+        prompt_messages,
+        tokenize=True,             # 返回 token ids，而不是字符串
+        add_generation_prompt=True,  # 在末尾加上 assistant 的开头标记
+        return_tensors=None,       # 返回 list，不返回 tensor（方便后续处理）
+    )
+
+    if hasattr(prompt_ids, "input_ids"):
+        prompt_ids = prompt_ids.input_ids     # BatchEncoding → 提取 input_ids
+    if hasattr(prompt_ids, "tolist"):
+        prompt_ids = prompt_ids.tolist()      # tensor → list
+
+    answer_ids = tokenizer(answer + tokenizer.eos_token, add_special_tokens=False)["input_ids"]
+    input_ids = prompt_ids + answer_ids
+    labels = [IGNORE_INDEX] * len(prompt_ids) + answer_ids
+    if len(input_ids) > max_length:
+        input_ids = input_ids[:max_length]
+        labels = labels[:max_length]
+
+    attention_mask = [1] * len(input_ids)
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
 
 
 # ============================================================
@@ -160,7 +204,35 @@ def load_model_and_lora(model_name, r=8, lora_alpha=16, lora_dropout=0.05):
     - alpha/r: 缩放因子
     """
     # TODO: 你的代码
-    pass
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token  # Qwen 没有 pad_token，用 eos 代替
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        # bfloat16: 省显存，精度损失小。RTX 30/40 系列支持 bfloat16
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        # device_map="auto": 自动分配到 GPU，如果显存不够会自动卸载到 CPU
+        device_map="auto" if torch.cuda.is_available() else None,
+        attn_implementation="sdpa" ,
+        trust_remote_code=True,
+    )
+    model.config.use_cache = False       # 训练时关闭 KV 缓存（省显存，训练不需要）
+    model.enable_input_require_grads()   # 让输入张量参与梯度计算（PEFT 需要）
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,    # 因果语言模型
+        r=r,                             # rank：低秩矩阵维度
+        lora_alpha=lora_alpha,                   # 缩放因子：16/8 = 2
+        lora_dropout=lora_dropout,               # dropout 防过拟合
+        target_modules=[                 # 对哪些线性层加 LoRA
+            "q_proj", "k_proj", "v_proj", "o_proj",  # 注意力层 4 个投影
+            "gate_proj", "up_proj", "down_proj",      # FFN 层 3 个投影
+        ],
+    )
+    model = get_peft_model(model, lora_config)    # 把 LoRA 挂到模型上
+    model.print_trainable_parameters()            # 打印可训练参数占比（预期 ~0.88%）
+    return tokenizer, model
 
 
 # ============================================================
@@ -196,7 +268,57 @@ def main():
     # TODO: 步骤 6 - 创建 Trainer，注意 data_collator 用 DataCollatorForSeq2Seq
     # TODO: 步骤 7 - trainer.train()
     # TODO: 步骤 8 - 保存 model.save_pretrained() 和 tokenizer.save_pretrained()
-    pass
+    tokenizer, model = load_model_and_lora(args.model_name, r=args.r)
+
+    train_items = load_jsonl(args.train_file)
+    valid_items = load_jsonl(args.valid_file)
+
+    if args.max_train_samples > 0:
+        train_items = train_items[: args.max_train_samples]
+    if args.max_valid_samples > 0:
+        valid_items = valid_items[: args.max_valid_samples]
+
+    train_dataset = Dataset.from_list(train_items).map(
+        lambda x: preprocess(x, tokenizer, args.max_length),
+        remove_columns=list(train_items[0].keys()),
+    )
+    valid_dataset = Dataset.from_list(valid_items).map(
+        lambda x: preprocess(x, tokenizer, args.max_length),
+        remove_columns=list(valid_items[0].keys()),
+    )
+
+    training_args = TrainingArguments(
+        output_dir=str(args.output_dir),
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.lr,
+        logging_steps=10,
+        save_steps=100,
+        eval_steps=100,
+        eval_strategy="steps",
+        save_strategy="steps",
+        save_total_limit=2,
+        bf16=torch.cuda.is_available(),
+        fp16=False,
+        report_to="none",
+        remove_unused_columns=False,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=valid_dataset,
+        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True),
+    )
+
+    trainer.train()
+
+    model.save_pretrained(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    print(f"LoRA adapter saved to {args.output_dir}")
 
 
 # ============================================================
