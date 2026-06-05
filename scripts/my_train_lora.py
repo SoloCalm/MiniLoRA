@@ -10,7 +10,7 @@
 
 运行方式（模块 4 训练）：
     python scripts/my_train_lora.py --max-train-samples 50 --max-valid-samples 20 --epochs 1 --grad-accum 4 --max-length 256
-    python scripts/my_train_lora.py --r 4 --output-dir outputs/lora-r4 --max-train-samples 200 --epochs 1
+    python scripts/my_train_lora.py --r 4 --output-dir outputs/lora-r4 --max-train-samples 200
 参考代码：scripts/train_lora.py（先看懂，关掉，再自己写）
 """
 
@@ -214,6 +214,7 @@ def load_model_and_lora(model_name, r=8, lora_alpha=16, lora_dropout=0.05):
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         # device_map="auto": 自动分配到 GPU，如果显存不够会自动卸载到 CPU
         device_map="auto" if torch.cuda.is_available() else None,
+        attn_implementation="sdpa" ,
         trust_remote_code=True,
     )
     model.config.use_cache = False       # 训练时关闭 KV 缓存（省显存，训练不需要）
